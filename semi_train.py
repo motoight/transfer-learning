@@ -117,9 +117,10 @@ parser.add_argument('--out-dir', type=str)
 parser.add_argument('--fix-encoder', action='store_true')
 parser.add_argument('--use_dropout', action='store_true')
 parser.add_argument('--use_labelsmooth', action='store_true')
-parser.add_argument('--threshold', type=float, default=0.9)
-parser.add_argument('--mu', type=int, default=7)
-parser.add_argument('--lambda_u', type=int, default=5)
+parser.add_argument('--threshold', type=float, default=0.9) # threshold for design whether model prediction is reliable
+parser.add_argument('--mu', type=int, default=7) # Hyper params to control the ratio take labeled and unlabeled data
+parser.add_argument('--lambda_u', type=int, default=5) # Hyper params to control loss_x and loss_u
+parser.add_argument('--print_interval', type=int, default=20) # print_interval=20 means in each epoch, print training msg each 20 step
 args = parser.parse_args()
 writer_comment = "_epochs={num_epochs}_fixed={fix_encoder}_smooth={use_labelsmooth}_bs={bs}_mu={mu}".format(
     num_epochs = args.num_epochs,
@@ -191,7 +192,7 @@ train_img_list, train_labels = parse_root(root)
 root = 'datasets/newborn2/newborn2/test'  # 改成自己的目录
 test_img_list, test_labels = parse_root(root)
 
-root = 'datasets/video_frame/video_frame/train' # 改成自己的目录
+root = 'datasets/video_framemid/video_framemid/train' # 改成自己的目录
 unlabel_img_list, unlabel_labels = parse_unlabel_root(root)
 
 
@@ -283,7 +284,7 @@ class TransformFixMatch(object):
 
 test_dataset = Def_Dataset(img_list=test_img_list, labels=test_labels, transform=transform_test)
 train_dataset = Def_Dataset(img_list=train_img_list, labels=train_labels, transform=transform_train)
-unlabeled_dataset = Def_unlabel_Dataset(img_list=unlabel_img_list, transform=TransformFixMatch())
+unlabeled_dataset = Def_unlabel_Dataset(img_list=unlabel_img_list, labels=unlabel_labels, transform=TransformFixMatch())
 
 # splloss = SPLLoss(n_samples=len(train_dataset))
 # 划分训练集为 trainset 和 evalset 按照8:2的比例
@@ -294,13 +295,14 @@ train_loader = DataLoader(dataset=train_dataset, batch_size=args.batch_size, num
                           shuffle=True)
 eval_loader = DataLoader(dataset=eval_dataset, batch_size=args.batch_size, num_workers=4, drop_last=False)
 test_loader = DataLoader(dataset=test_dataset, batch_size=args.batch_size, num_workers=4, drop_last=False)
-unlabeled_loader = DataLoader(dataset=unlabeled_dataset, batch_size=args.batch_size * args.mu, num_workers=4, drop_last=False, shuffle=False)
+unlabeled_loader = DataLoader(dataset=unlabeled_dataset, batch_size=args.batch_size * args.mu, num_workers=4, drop_last=False, shuffle=True)
 
 print('Labeled batch size :{}. Unlabeled batch size :{}'.format(args.batch_size, args.batch_size*args.mu))
 
 train_losses = AverageMeter()
 train_lossesx = AverageMeter()
 train_lossesu = AverageMeter()
+Consis_loss = AverageMeter()
 eval_losses = AverageMeter()
 # 标签平滑项设置为0.1
 labelsmoothLoss = LabelSmoothing(smoothing=0.1)
@@ -355,16 +357,18 @@ def train(epoch, model, labeled_loader, unlabeled_loader, optimizer):
             input_x, labels, idx = labeled_loader_iter.next()
         # 防止取unlabel data时没有数据
         try:
-            input_uw, input_us = unlabeled_loader_iter.next()
+            input_uw, input_us, labels_u = unlabeled_loader_iter.next()
         except StopIteration:
             unlabeled_loader_iter = iter(unlabeled_loader)
-            input_uw, input_us = unlabeled_loader_iter.next()
+            input_uw, input_us, labels_u = unlabeled_loader_iter.next()
 
         batch_size = input_x.size(0)
         inputs = torch.cat((input_x, input_uw, input_us))
 
+
         inputs = inputs.cuda()
         labels = labels.cuda()
+        labels_u = labels_u.cuda()
         outputs = model(inputs)
 
         logits_x = outputs[:batch_size]
@@ -372,51 +376,66 @@ def train(epoch, model, labeled_loader, unlabeled_loader, optimizer):
 
         pseudo_label = torch.softmax(logits_u_w.detach(), dim=-1)
         max_probs, targets_u = torch.max(pseudo_label, dim=-1)
-
-        # wandb.log({'pesudo label max prob': wandb.Histogram(max_probs.cpu().numpy())}, commit=False)
-        # d_threshold = args.threshold + (1-args.threshold)/5 * int((epoch+1)*5/args.num_epochs) # dynamic threshold
         mask = max_probs.ge(args.threshold)
 
+        # if model prediction probability is higher than threshold, take the model prediction as pseudo label
+        # else take the original label as label to simulate active learning phase
+        refine_labels_u = torch.where(mask, targets_u, labels_u)
+
+        # if args.use_labelsmooth:
+        #     Lx = labelsmoothLoss(logits_x, labels, reduction='mean')
+        #     Lu = torch.mean(labelsmoothLoss(logits_u_s, targets_u, reduction='none') * mask.float())
+        # else:
+        #     Lx = F.cross_entropy(logits_x, labels, reduction='mean')
+        #     Lu = (F.cross_entropy(logits_u_s, targets_u, reduction='none') * mask).mean()
         if args.use_labelsmooth:
             Lx = labelsmoothLoss(logits_x, labels, reduction='mean')
-            Lu = torch.mean(labelsmoothLoss(logits_u_s, targets_u, reduction='none') * mask.float())
+            Lu = labelsmoothLoss(logits_u_w, refine_labels_u, reduction='mean')
         else:
             Lx = F.cross_entropy(logits_x, labels, reduction='mean')
-            Lu = (F.cross_entropy(logits_u_s, targets_u, reduction='none') * mask).mean()
+            Lu = F.cross_entropy(logits_u_w, refine_labels_u , reduction='mean')
+        # 一致性约束，对于unlabel样本通过强弱增广预测结果一致来约束网络稳定性
+        consistency_loss = torch.mean((logits_u_s - logits_u_w)**2)
+
 
         _, pred = torch.max(logits_x, 1)
         correct += (pred == labels).sum()
         total += labels.size(0)
 
-        loss = Lx + args.lambda_u * Lu
+        loss = Lx + args.lambda_u * Lu + consistency_loss
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         train_losses.update(loss.item())
         train_lossesx.update(Lx.item())
         train_lossesu.update(Lu.item())
-        print("Train Epoch: {epoch}/{epochs:4}. Step: {step}/{num_iter:4}. Loss: {loss:.4f}. Lossx: {lossx:.4f}. Lossu: {lossu:.4f}.".format(
-            epoch=epoch + 1,
-            step=i+1,
-            epochs=args.num_epochs,
-            num_iter=num_iter,
-            loss=train_losses.avg,
-            lossx=train_lossesx.avg,
-            lossu=train_lossesu.avg,
-        ))
+        Consis_loss.update(consistency_loss.item())
+        if (i+1)%args.print_interval==0:
+            print("Train Epoch: {epoch}/{epochs:4}. Step: {step}/{num_iter:4}. Loss: {loss:.4f}. Lossx: {lossx:.4f}. Lossu: {lossu:.4f}. Consis_loss: {consis_loss:.4f}.".format(
+                epoch=epoch + 1,
+                step=i+1,
+                epochs=args.num_epochs,
+                num_iter=num_iter,
+                loss=train_losses.avg,
+                lossx=train_lossesx.avg,
+                lossu=train_lossesu.avg,
+                consis_loss=Consis_loss.avg
+            ))
 
     acc = float(correct / total)
     writer.add_scalar('Loss/train_loss', train_losses.avg, epoch + 1)
     writer.add_scalar('Loss/train_lossx', train_lossesx.avg, epoch + 1)
     writer.add_scalar('Loss/train_lossu', train_lossesu.avg, epoch + 1)
+    writer.add_scalar('Loss/consistency_loss', Consis_loss.avg, epoch + 1)
     writer.add_scalar('Acc/train_acc', acc, epoch + 1)
-    print("Train Epoch: {epoch}/{epochs:4}.  Loss: {loss:.4f}. Lossx: {lossx:.4f}. Lossu: {lossu:.4f}."
+    print("Train Epoch: {epoch}/{epochs:4}.  Loss: {loss:.4f}. Lossx: {lossx:.4f}. Lossu: {lossu:.4f}. Consis_loss: {consis_loss:.4f}."
           "Acc: {Acc:.4f}.".format(
         epoch=epoch + 1,
         epochs=args.num_epochs,
         loss=train_losses.avg,
         lossx=train_lossesx.avg,
         lossu=train_lossesu.avg,
+        consis_loss = Consis_loss.avg,
         Acc=acc
     ))
 
